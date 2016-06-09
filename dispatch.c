@@ -355,6 +355,7 @@ _initThreads(pthread_t threads[], const size_t nThreads) {
       pthread_attr_destroy(&attributes);
       return DISPATCH_INTERNAL_ERR;
     }
+    CPU_ZERO(&cpuset);
     CPU_SET(index, &cpuset);
     snprintf(threadName, sizeof(threadName) - 1, THREAD_NAME, index);
     /* if name isn't set, not a deal killing issue */
