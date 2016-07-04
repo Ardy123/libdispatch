@@ -20,11 +20,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <semaphore.h>
 #include "dispatch.h"
 /* ------------ */
 #define STACKSZ (64 * 1024)
-#define WORKQUEUESZ (4)
 #define THREAD_NAME "dispatch-%lu"
 /* ------------ */
 typedef enum {
@@ -45,96 +43,81 @@ struct dispatch_task {
   void * m_pCtx;
   void * m_pReturn;
   task_state m_state;
+  dispatch_task m_pNxt;
 };
 /* ------------ */
 typedef struct {
-  sem_t m_full;
-  sem_t m_empty;
-  unsigned int m_start;
-  unsigned int m_end;
-  dispatch_task m_queue[WORKQUEUESZ];
+  pthread_mutex_t m_lock;
+  pthread_cond_t m_signal;
+  dispatch_task  m_pLst;
 } dispatch_queue;
 /* ------------ */
 typedef struct {  
   size_t m_nThreads;
-  pthread_mutex_t m_schdlLock;
   int m_quit;
-  dispatch_queue * m_pQueues;  
-  pthread_t m_threads[];
+  dispatch_queue m_queue;
+  pthread_t m_threads[0];
 } dispatch_engine;
-/* ------------ */
-typedef struct {
-  int * m_pQuit;
-  dispatch_queue * m_pQueue;
-} dispatch_threadCtx;
 /* ------------ */
 static dispatch_engine* gspTaskEngine;
 /* ------------ */
 static dispatch_error _initThreads(pthread_t[], const size_t);
-static void _destroyThreads(pthread_t[], dispatch_queue[], const size_t);
+static void _destroyThreads(pthread_t[], const size_t);
 static void * _threadProc(void *);
-static dispatch_error _initQueues(dispatch_queue[], const size_t);
-static void _destroyQueues(dispatch_queue[], const size_t);
-static unsigned _minItemsQueues(dispatch_queue[], const size_t, unsigned);
-static void _insertQueues(dispatch_queue[],
-			  dispatch_task,
-			  const size_t,
-			  const unsigned);
-static void _queueInsert(dispatch_queue *, dispatch_task);
-static dispatch_task _queueRemove(dispatch_queue *);
+static dispatch_error _initQueue(dispatch_queue *);
+static dispatch_error _destroyQueue(dispatch_queue *);
+static void _pushQueue(dispatch_queue *, dispatch_task);
+static dispatch_task _popQueueNoLock(dispatch_queue *);
+static dispatch_task _popQueue(dispatch_queue *, int *);
 static int _isCallingFromThreads(pthread_t[], const size_t, const pthread_t);
-static void _cancelWaiting(dispatch_task[], unsigned, unsigned);
 /* ------------ */
 dispatch_error
-dispatch_engine_init(void) {
-  /* todo: add error handling */
+dispatch_engine_init(void) {  
   dispatch_error err = DISPATCH_OK;
   const unsigned nProcessors = (unsigned)sysconf(_SC_NPROCESSORS_ONLN);
-  const size_t deStrcSize = sizeof(dispatch_engine);
-  const size_t dqObjSize = sizeof(dispatch_queue) * nProcessors;
-  const size_t deObjSize = deStrcSize + (sizeof(pthread_t) * nProcessors);
+  const size_t dispatchEngineSz =
+    sizeof(dispatch_engine) + (nProcessors * sizeof(pthread_t));
   
-  if (!(gspTaskEngine = malloc(deObjSize))) {
+  if (gspTaskEngine) {
+    err = DISPATCH_INVALID_OPERATION;
+    goto dispatch_engine_init_err;
+  }
+  if (!(gspTaskEngine = calloc(1, dispatchEngineSz))) {
     err = DISPATCH_MEMORY_ERR;
     goto dispatch_engine_init_err;
   }
-  memset(gspTaskEngine, 0, deObjSize);
   gspTaskEngine->m_nThreads = nProcessors;
-  if (pthread_mutex_init(&gspTaskEngine->m_schdlLock, NULL)) {
-    err = DISPATCH_INTERNAL_ERR;
-    goto dispatch_engine_init_err;    
+  if (DISPATCH_OK != (err = _initQueue(&gspTaskEngine->m_queue))) {
+    goto dispatch_engine_init_err1;
   }
-  if (!(gspTaskEngine->m_pQueues = malloc(dqObjSize))) {
-    err = DISPATCH_MEMORY_ERR;
-    goto dispatch_engine_init_err;    
-  }
-  memset(gspTaskEngine->m_pQueues, 0, dqObjSize);
-  if ((err = _initQueues(gspTaskEngine->m_pQueues, nProcessors))) {
-    goto dispatch_engine_init_err;
-  }
-  if ((err = _initThreads(gspTaskEngine->m_threads, nProcessors))) {
-    goto dispatch_engine_init_err;    
-  }
+  if (DISPATCH_OK !=
+      (err = _initThreads(gspTaskEngine->m_threads, nProcessors))) {
+    goto dispatch_engine_init_err2;
+  } 
   return err;
+ dispatch_engine_init_err2:
+  _destroyQueue(&gspTaskEngine->m_queue);
+ dispatch_engine_init_err1:
+  free(gspTaskEngine), gspTaskEngine = NULL;
  dispatch_engine_init_err:
-  if (gspTaskEngine && gspTaskEngine->m_pQueues)
-    free(gspTaskEngine->m_pQueues);
-  if (gspTaskEngine)
-    free(gspTaskEngine);
   return err;
 }
 /* ------------ */
 dispatch_error
 dispatch_engine_destroy(void) {
   if (gspTaskEngine) {
+    /* signal exit */
     gspTaskEngine->m_quit = -1;
-    _destroyThreads(gspTaskEngine->m_threads,
-		    gspTaskEngine->m_pQueues,
-		    gspTaskEngine->m_nThreads);
-    _destroyQueues(gspTaskEngine->m_pQueues, gspTaskEngine->m_nThreads);
-    pthread_mutex_destroy(&gspTaskEngine->m_schdlLock);
-    free(gspTaskEngine->m_pQueues);
+    pthread_mutex_lock(&gspTaskEngine->m_queue.m_lock);
+    pthread_cond_broadcast(&gspTaskEngine->m_queue.m_signal);
+    pthread_mutex_unlock(&gspTaskEngine->m_queue.m_lock);
+    /* destroy all threads */
+    _destroyThreads(gspTaskEngine->m_threads, gspTaskEngine->m_nThreads);
+    /* destroy queue */
+    _destroyQueue(&gspTaskEngine->m_queue);
+    /* shutdown engine */
     free(gspTaskEngine);
+    gspTaskEngine = NULL;
     return DISPATCH_OK;
   }
   return DISPATCH_INVALID_OPERATION;
@@ -142,11 +125,10 @@ dispatch_engine_destroy(void) {
 /* ------------ */
 dispatch_task
 dispatch_init(dispatch_func pFunc, dispatch_cnlCb pCancel, void * pContext) {
-  struct dispatch_task * pTask = malloc(sizeof(struct dispatch_task));
+  struct dispatch_task * pTask = calloc(1, sizeof(struct dispatch_task));
   if (!pTask || !pFunc || !pCancel) {
     goto dispatch_init_err;
   }
-  memset(pTask, 0, sizeof(struct dispatch_task));
   pTask->m_run = pFunc;
   pTask->m_cancel = pCancel;
   pTask->m_pCtx = pContext;
@@ -173,11 +155,10 @@ dispatch_initEx(dispatch_func pFunc,
 		dispatch_cnlCb pCancel,
 		dispatch_endCb pEnd,
 		void * pContext) {
-  struct dispatch_task * pTask = malloc(sizeof(struct dispatch_task));
+  struct dispatch_task * pTask = calloc(1, sizeof(struct dispatch_task));
   if (!pTask || !pFunc || !pCancel || !pEnd) {
     goto dispatch_initEx_err;
   }
-  memset(pTask, 0, sizeof(struct dispatch_task));
   pTask->m_run = pFunc;
   pTask->m_cancel = pCancel;
   pTask->m_end = pEnd;
@@ -204,34 +185,23 @@ dispatch_error
 dispatch_schedule(dispatch_task pTask) {
   dispatch_error retVal = DISPATCH_INVALID_OPERAND;
   if (pTask) {
-    /* check that its not being called from inside a task */
-    if (_isCallingFromThreads(gspTaskEngine->m_threads,
-			      gspTaskEngine->m_nThreads,
-			      pthread_self())) {
-      retVal = DISPATCH_INVALID_OPERATION;
-    } else {    
+    if (!_isCallingFromThreads(gspTaskEngine->m_threads,
+			       gspTaskEngine->m_nThreads,
+			       pthread_self())) {    
       switch (pTask->m_state) {
       case DISPATCH_INIT:
       case DISPATCH_CANCELED:
-      case DISPATCH_RAN: {
-	unsigned min = -1;
+      case DISPATCH_RAN:
 	pTask->m_state = DISPATCH_SCHEDULED;
-	pthread_mutex_lock(&gspTaskEngine->m_schdlLock);      
-	min = _minItemsQueues(gspTaskEngine->m_pQueues,
-			      gspTaskEngine->m_nThreads,
-			      min);
-	_insertQueues(gspTaskEngine->m_pQueues,
-		      pTask,
-		      gspTaskEngine->m_nThreads,
-		      min); 
-	pthread_mutex_unlock(&gspTaskEngine->m_schdlLock);
+	_pushQueue(&gspTaskEngine->m_queue, pTask);
 	retVal = DISPATCH_OK;
 	break;
-      }
       default:
 	retVal = DISPATCH_INVALID_OPERATION;
 	break;
       }
+    } else {
+      retVal = DISPATCH_INVALID_OPERATION;
     }
   }
   return retVal;
@@ -325,39 +295,28 @@ dispatch_destroy(dispatch_task pTask) {
 /* ------------ */
 static dispatch_error
 _initThreads(pthread_t threads[], const size_t nThreads) {
-  char threadName[32];
-  pthread_attr_t attributes;
-  if (pthread_attr_init(&attributes)) {
-    return DISPATCH_INTERNAL_ERR;
-  }
-  if (pthread_attr_setstacksize(&attributes, STACKSZ)) {
-    pthread_attr_destroy(&attributes);
-    return DISPATCH_INTERNAL_ERR;    
-  }
-  if (nThreads < 1) {
-    if (pthread_attr_destroy(&attributes)) {
+  if (nThreads > 0) {    
+    char threadName[32];
+    cpu_set_t cpuset;
+    pthread_attr_t attributes;
+    const size_t index = nThreads - 1;
+    CPU_ZERO(&cpuset);
+    CPU_SET(index, &cpuset);
+    snprintf(threadName, sizeof(threadName) - 1, THREAD_NAME, index);    
+    if (pthread_attr_init(&attributes)) {
       return DISPATCH_INTERNAL_ERR;
     }
-  } else {
-    cpu_set_t cpuset;
-    const size_t index = nThreads - 1;
-    dispatch_threadCtx * pTContext = malloc(sizeof(dispatch_threadCtx));
-    if (!pTContext) {
-      return DISPATCH_MEMORY_ERR;
-    }
-    pTContext->m_pQuit = &gspTaskEngine->m_quit;
-    pTContext->m_pQueue= &gspTaskEngine->m_pQueues[index];    
-    if (pthread_create(&threads[index],
-		       &attributes,
-		       _threadProc,
-		       pTContext)) {
-      free(pTContext);
+    if (pthread_attr_setstacksize(&attributes, STACKSZ)) {
       pthread_attr_destroy(&attributes);
       return DISPATCH_INTERNAL_ERR;
     }
-    CPU_ZERO(&cpuset);
-    CPU_SET(index, &cpuset);
-    snprintf(threadName, sizeof(threadName) - 1, THREAD_NAME, index);
+    if (pthread_create(&threads[index],
+		       &attributes,
+		       _threadProc,
+		       gspTaskEngine)) {
+      pthread_attr_destroy(&attributes);
+      return DISPATCH_INTERNAL_ERR;
+    }
     /* if name isn't set, not a deal killing issue */
     pthread_setname_np(threads[index], threadName);
     /* if affinity isn't set, not a deal killing issue */
@@ -369,24 +328,19 @@ _initThreads(pthread_t threads[], const size_t nThreads) {
 }
 /* ------------ */
 static void
-_destroyThreads(pthread_t threads[],
-		dispatch_queue queues[],
-		const size_t nThreads) {
+_destroyThreads(pthread_t threads[], const size_t nThreads) {
   if (nThreads > 0) {
-    void * pThreadVal;
     const size_t index = nThreads - 1;
-    sem_post(&queues[index].m_full);
-    pthread_join(threads[index], &pThreadVal);
-    free(pThreadVal);
-    _destroyThreads(threads, queues, index);
+    pthread_join(threads[index], NULL);
+    _destroyThreads(threads, index);
   }
 }
 /* ------------ */
 static void * _threadProc(void * pUser) {
-  dispatch_threadCtx * pCtx = (dispatch_threadCtx *)pUser;
-  while(0 == *pCtx->m_pQuit) {
-    dispatch_task pTask = _queueRemove(pCtx->m_pQueue);
-    if (0 == *pCtx->m_pQuit) {
+  dispatch_engine * pEngine = (dispatch_engine *)pUser;
+  while(0 == pEngine->m_quit) {    
+    dispatch_task pTask = _popQueue(&pEngine->m_queue, &pEngine->m_quit);
+    if (pTask) {
       /* make sure task is in proper state (not canceled, etc..) */    
       if (DISPATCH_SCHEDULED == pTask->m_state) {
 	/* execute task */
@@ -414,72 +368,65 @@ static void * _threadProc(void * pUser) {
 }
 /* ------------ */
 static dispatch_error
-_initQueues(dispatch_queue queues[], const size_t nQueues) {
-  if (nQueues > 0) {
-    const size_t index = nQueues - 1;
-    queues[index].m_start = queues[index].m_end = 0;
-    if (sem_init(&queues[index].m_full, 0, 0) ||
-	sem_init(&queues[index].m_empty, 0, WORKQUEUESZ)) {
-      return DISPATCH_INTERNAL_ERR;
-    }    
-    return _initQueues(queues, index);
+_initQueue(dispatch_queue * pQueue) {
+  dispatch_error err = DISPATCH_OK;  
+  if (pthread_mutex_init(&pQueue->m_lock, NULL)) {
+    err = DISPATCH_INTERNAL_ERR; 
+  } else if (pthread_cond_init(&pQueue->m_signal, NULL)) {
+    pthread_mutex_destroy(&pQueue->m_lock);
+    err = DISPATCH_INTERNAL_ERR; 
   }
-  return DISPATCH_OK;
+  return err;
+}
+/* ------------ */
+static dispatch_error
+_destroyQueue(dispatch_queue * pQueue) {
+  dispatch_task pTask= NULL;
+  dispatch_error err = DISPATCH_OK;
+  /* cancel all tasks on Queue */
+  pthread_mutex_lock(&pQueue->m_lock);
+  while (NULL != (pTask = _popQueueNoLock(pQueue))) {
+    pTask->m_state = DISPATCH_CANCELED;
+    if (pTask->m_cancel) {
+      pTask->m_cancel(pTask, pTask->m_pCtx);
+    }
+  }
+  pthread_mutex_unlock(&pQueue->m_lock);
+  /* destroy lock & signal */
+  if (pthread_cond_destroy(&pQueue->m_signal) ||
+      pthread_mutex_destroy(&pQueue->m_lock)) {
+    err = DISPATCH_INTERNAL_ERR;     
+  }
+  return err;
 }
 /* ------------ */
 static void
-_destroyQueues(dispatch_queue queues[], const size_t nQueues) {
-  if (nQueues > 0) {
-    const size_t index = nQueues - 1;
-    dispatch_queue * pQueue = &queues[index];
-    _cancelWaiting(pQueue->m_queue, pQueue->m_start, pQueue->m_end);
-    sem_destroy(&pQueue->m_empty);
-    sem_destroy(&pQueue->m_full);
-    _destroyQueues(queues, index);
-  }
-}
-/* ------------ */
-static void
-_queueInsert(dispatch_queue * pQueue, dispatch_task task) {
-  sem_wait(&pQueue->m_empty);
-  pQueue->m_queue[pQueue->m_end++ & (WORKQUEUESZ - 1)] = task;
-  sem_post(&pQueue->m_full);
+_pushQueue(dispatch_queue * pQueue, dispatch_task pTask) {
+  dispatch_task * ppNode;
+  pthread_mutex_lock(&pQueue->m_lock);
+  for (ppNode = &pQueue->m_pLst; *ppNode; ppNode = &((*ppNode)->m_pNxt)) {}
+  *ppNode = pTask;
+  pthread_cond_signal(&pQueue->m_signal);
+  pthread_mutex_unlock(&pQueue->m_lock);
 }
 /* ------------ */
 static dispatch_task
-_queueRemove(dispatch_queue * pQueue) {
-  dispatch_task pRetTask = NULL;
-  sem_wait(&pQueue->m_full);
-  pRetTask = pQueue->m_queue[pQueue->m_start++ & (WORKQUEUESZ - 1)];
-  sem_post(&pQueue->m_empty);
-  return pRetTask;
+_popQueueNoLock(dispatch_queue * pQueue) {
+  dispatch_task pTask = pQueue->m_pLst;
+  pQueue->m_pLst = (pTask) ? pTask->m_pNxt : NULL;
+  return pTask;  
 }
 /* ------------ */
-static unsigned
-_minItemsQueues(dispatch_queue queues[], const size_t nQueues, unsigned min) {
-  if (nQueues > 0) {
-    const size_t index = nQueues - 1;
-    const unsigned items = queues[index].m_end - queues[index].m_start;
-    min = (min > items) ? items : min;
-    return _minItemsQueues(queues, index, min);
+static dispatch_task
+_popQueue(dispatch_queue * pQueue, int * pExit) {
+  dispatch_task pTask;
+  pthread_mutex_lock(&pQueue->m_lock);
+  while (!pQueue->m_pLst && !*pExit) {
+    pthread_cond_wait(&pQueue->m_signal, &pQueue->m_lock);
   }
-  return min;
-}
-/* ------------ */
-static void
-_insertQueues(dispatch_queue queues[],
-	      dispatch_task task,
-	      const size_t nQueues,
-	      const unsigned min) {
-  if (nQueues > 0) {
-    const size_t index = nQueues - 1;
-    const int items = queues[index].m_end - queues[index].m_start;
-    if (min == items) {
-      _queueInsert(&queues[index], task);
-    } else {
-      _insertQueues(queues, task, index, min);
-    }
-  }
+  pTask = _popQueueNoLock(pQueue);
+  pthread_mutex_unlock(&pQueue->m_lock);
+  return pTask;
 }
 /* ------------ */
 static int
@@ -492,18 +439,4 @@ _isCallingFromThreads(pthread_t threads[],
 	    _isCallingFromThreads(threads, index, threadId));
   }
   return 0;
-}
-/* ------------ */
-static void
-_cancelWaiting(dispatch_task dispatch[], unsigned start, unsigned end) {
-  if (start < end) {
-    dispatch_task pTask = dispatch[start & (WORKQUEUESZ - 1)];
-    pthread_mutex_lock(&pTask->m_lock);
-    pTask->m_state = DISPATCH_CANCELED;
-    pthread_mutex_lock(&pTask->m_lock);
-    if (pTask->m_cancel) {
-      pTask->m_cancel(pTask, pTask->m_pCtx);
-    }
-    _cancelWaiting(dispatch, start + 1, end);
-  }
 }

@@ -10,6 +10,7 @@
 #include "dispatch.h"
 /* ------------ */
 #define OUTPUT_FILE "unittest"
+#define NUM_SLAM_TASKS (1024 * 100)
 /* ------------ */
 typedef enum {
   TSTTASK_INIT = 0,
@@ -279,7 +280,7 @@ _funcTest_07(void) {
 static void
 _funcTest_08(void) {
   int ndx;
-  const int nTasks = (int)sysconf(_SC_NPROCESSORS_ONLN) * 2;
+  const int nTasks = NUM_SLAM_TASKS;
   dispatch_task * ppTask = malloc(sizeof(dispatch_task) * nTasks);
   test_context * pCtx = malloc(sizeof(test_context) * nTasks);
   /* init tasks */
@@ -313,7 +314,7 @@ _funcTest_08(void) {
 static void
 _funcTest_09(void) {
   int ndx;
-  const int nTasks = (int)sysconf(_SC_NPROCESSORS_ONLN) * 2;
+  const int nTasks = NUM_SLAM_TASKS;
   dispatch_task * ppTask = malloc(sizeof(dispatch_task) * nTasks);
   test_context * pCtx = malloc(sizeof(test_context) * nTasks);
   /* init tasks */
