@@ -37,7 +37,6 @@ struct dispatch_task {
   dispatch_func m_run;
   dispatch_cnlCb m_cancel;
   dispatch_endCb m_end;
-  pthread_mutex_t m_lock;
   pthread_mutex_t m_waitLock;
   pthread_cond_t m_wait;
   void * m_pCtx;
@@ -132,16 +131,11 @@ dispatch_init(dispatch_func pFunc, dispatch_cnlCb pCancel, void * pContext) {
   pTask->m_run = pFunc;
   pTask->m_cancel = pCancel;
   pTask->m_pCtx = pContext;
-  if (pthread_mutex_init(&pTask->m_lock, NULL)) {
-    goto dispatch_init_err;
-  }
   if (pthread_mutex_init(&pTask->m_waitLock, NULL)) {
-    pthread_mutex_destroy(&pTask->m_lock);
     goto dispatch_init_err;
   }
   if (pthread_cond_init(&pTask->m_wait, NULL)) {
     pthread_mutex_destroy(&pTask->m_waitLock);
-    pthread_mutex_destroy(&pTask->m_lock);
     goto dispatch_init_err;
   }
   return pTask;
@@ -163,16 +157,11 @@ dispatch_initEx(dispatch_func pFunc,
   pTask->m_cancel = pCancel;
   pTask->m_end = pEnd;
   pTask->m_pCtx = pContext;
-  if (pthread_mutex_init(&pTask->m_lock, NULL)) {
-    goto dispatch_initEx_err;
-  }
   if (pthread_mutex_init(&pTask->m_waitLock, NULL)) {
-    pthread_mutex_destroy(&pTask->m_lock);
     goto dispatch_initEx_err;
   }
   if (pthread_cond_init(&pTask->m_wait, NULL)) {
     pthread_mutex_destroy(&pTask->m_waitLock);
-    pthread_mutex_destroy(&pTask->m_lock);
     goto dispatch_initEx_err;
   }
   return pTask;
@@ -211,17 +200,13 @@ dispatch_error
 dispatch_cancel(dispatch_task pTask) {
   dispatch_error retVal = DISPATCH_INVALID_OPERAND;
   if (pTask) {
-    pthread_mutex_lock(&pTask->m_lock);
-    switch (pTask->m_state) {
-    case DISPATCH_SCHEDULED: {
-      pTask->m_state = DISPATCH_CANCELED;
+    if (__sync_bool_compare_and_swap(&pTask->m_state,
+				     DISPATCH_SCHEDULED,
+				     DISPATCH_CANCELED)) {
       retVal = DISPATCH_OK;
-      break;
-    }
-    default:
+    } else {
       retVal = DISPATCH_INVALID_OPERATION;
     }
-    pthread_mutex_unlock(&pTask->m_lock);    
   }
   return retVal;
 }
@@ -255,8 +240,7 @@ void *
 dispatch_return(dispatch_task pTask) {
   void * pRetVal = NULL;
   if (pTask) {
-    pthread_mutex_lock(&pTask->m_lock);
-    switch (pTask->m_state) {
+    switch (__sync_fetch_and_and(&pTask->m_state, -1)) {
     case DISPATCH_RAN: {
       pRetVal = pTask->m_pReturn;
       break;
@@ -264,7 +248,6 @@ dispatch_return(dispatch_task pTask) {
     default:
       break;
     }
-    pthread_mutex_unlock(&pTask->m_lock);      
   }
   return pRetVal;  
 }
@@ -273,20 +256,16 @@ dispatch_error
 dispatch_destroy(dispatch_task pTask) {
   dispatch_error retVal = DISPATCH_INVALID_OPERAND;
   if (pTask) {
-    pthread_mutex_lock(&pTask->m_lock);
     switch (pTask->m_state) {
     case DISPATCH_INIT:
     case DISPATCH_CANCELED:
     case DISPATCH_RAN:
-      pthread_mutex_unlock(&pTask->m_lock);
       pthread_cond_destroy(&pTask->m_wait);
       pthread_mutex_destroy(&pTask->m_waitLock);
-      pthread_mutex_destroy(&pTask->m_lock);      
       free(pTask);
       retVal = DISPATCH_OK;
       break;
     default:
-      pthread_mutex_unlock(&pTask->m_lock);    	    
       retVal = DISPATCH_INVALID_OPERATION;
     }
   }
@@ -342,18 +321,17 @@ static void * _threadProc(void * pUser) {
     dispatch_task pTask = _popQueue(&pEngine->m_queue, &pEngine->m_quit);
     if (pTask) {
       /* make sure task is in proper state (not canceled, etc..) */    
-      if (DISPATCH_SCHEDULED == pTask->m_state) {
+      if (DISPATCH_SCHEDULED == __sync_fetch_and_and(&pTask->m_state, -1)) {
 	/* execute task */
 	pTask->m_pReturn = pTask->m_run(pTask, pTask->m_pCtx);
 	/* update task state */
-	pthread_mutex_lock(&pTask->m_lock);
-	if (DISPATCH_SCHEDULED == pTask->m_state) {
-	  pTask->m_state = DISPATCH_RAN;
-	}
-	pthread_mutex_unlock(&pTask->m_lock);
+	__sync_bool_compare_and_swap(&pTask->m_state,
+				     DISPATCH_SCHEDULED,
+				     DISPATCH_RAN);
       }
       /* invoke finished or canceled callback */
-      if (pTask->m_end && DISPATCH_RAN == pTask->m_state) {
+      if (pTask->m_end &&
+	  DISPATCH_RAN == __sync_fetch_and_and(&pTask->m_state, -1)) {
 	pTask->m_end(pTask, pTask->m_pCtx, pTask->m_pReturn);
       } else if (pTask->m_cancel && DISPATCH_CANCELED == pTask->m_state) {
 	pTask->m_cancel(pTask, pTask->m_pCtx);
