@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <semaphore.h>
 #include <pthread.h>
 #include "dispatch.h"
 /* ------------ */
@@ -47,7 +48,7 @@ struct dispatch_task {
 /* ------------ */
 typedef struct {
   pthread_mutex_t m_lock;
-  pthread_cond_t m_signal;
+  sem_t m_empty;
   dispatch_task  m_pLst;
 } dispatch_queue;
 /* ------------ */
@@ -105,11 +106,12 @@ dispatch_engine_init(void) {
 dispatch_error
 dispatch_engine_destroy(void) {
   if (gspTaskEngine) {
+    int ndx;
     /* signal exit */
     gspTaskEngine->m_quit = -1;
-    pthread_mutex_lock(&gspTaskEngine->m_queue.m_lock);
-    pthread_cond_broadcast(&gspTaskEngine->m_queue.m_signal);
-    pthread_mutex_unlock(&gspTaskEngine->m_queue.m_lock);
+    for (ndx = 0; ndx < gspTaskEngine->m_nThreads; ++ndx) {
+      sem_post(&gspTaskEngine->m_queue.m_empty);
+    }
     /* destroy all threads */
     _destroyThreads(gspTaskEngine->m_threads, gspTaskEngine->m_nThreads);
     /* destroy queue */
@@ -350,7 +352,7 @@ _initQueue(dispatch_queue * pQueue) {
   dispatch_error err = DISPATCH_OK;  
   if (pthread_mutex_init(&pQueue->m_lock, NULL)) {
     err = DISPATCH_INTERNAL_ERR; 
-  } else if (pthread_cond_init(&pQueue->m_signal, NULL)) {
+  } else if (sem_init(&pQueue->m_empty, 0, 0)) {
     pthread_mutex_destroy(&pQueue->m_lock);
     err = DISPATCH_INTERNAL_ERR; 
   }
@@ -371,7 +373,7 @@ _destroyQueue(dispatch_queue * pQueue) {
   }
   pthread_mutex_unlock(&pQueue->m_lock);
   /* destroy lock & signal */
-  if (pthread_cond_destroy(&pQueue->m_signal) ||
+  if (sem_destroy(&pQueue->m_empty) ||
       pthread_mutex_destroy(&pQueue->m_lock)) {
     err = DISPATCH_INTERNAL_ERR;     
   }
@@ -384,8 +386,8 @@ _pushQueue(dispatch_queue * pQueue, dispatch_task pTask) {
   pthread_mutex_lock(&pQueue->m_lock);
   for (ppNode = &pQueue->m_pLst; *ppNode; ppNode = &((*ppNode)->m_pNxt)) {}
   *ppNode = pTask;
-  pthread_cond_signal(&pQueue->m_signal);
   pthread_mutex_unlock(&pQueue->m_lock);
+  sem_post(&pQueue->m_empty);
 }
 /* ------------ */
 static dispatch_task
@@ -398,10 +400,8 @@ _popQueueNoLock(dispatch_queue * pQueue) {
 static dispatch_task
 _popQueue(dispatch_queue * pQueue, int * pExit) {
   dispatch_task pTask;
+  sem_wait(&pQueue->m_empty);
   pthread_mutex_lock(&pQueue->m_lock);
-  while (!pQueue->m_pLst && !*pExit) {
-    pthread_cond_wait(&pQueue->m_signal, &pQueue->m_lock);
-  }
   pTask = _popQueueNoLock(pQueue);
   pthread_mutex_unlock(&pQueue->m_lock);
   return pTask;
@@ -411,10 +411,7 @@ static int
 _isCallingFromThreads(pthread_t threads[],
 		      const size_t nThreads,
 		      const pthread_t threadId) {
-  if (nThreads > 0) {
-    const size_t index = nThreads - 1;    
-    return ((threadId == threads[index]) |
-	    _isCallingFromThreads(threads, index, threadId));
-  }
-  return 0;
+  int ndx;
+  for (ndx = 0; (ndx < nThreads) && (threadId != threads[ndx]); ++ndx) { }
+  return (ndx != nThreads);
 }
