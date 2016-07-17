@@ -215,6 +215,7 @@ dispatch_cancel(dispatch_task pTask) {
 /* ------------ */
 dispatch_error
 dispatch_wait(dispatch_task tasks[], size_t length) {
+  unsigned i;
   /* verify arguments */
   if (NULL == tasks || 0 == length) {
     return DISPATCH_INVALID_OPERAND;
@@ -226,14 +227,12 @@ dispatch_wait(dispatch_task tasks[], size_t length) {
     return DISPATCH_INVALID_OPERATION;
   }    
   /* wait for jobs to finish */
-  if (length > 0) {
-    const unsigned index = length - 1;
-    pthread_mutex_lock(&tasks[index]->m_waitLock);      
-    while (DISPATCH_SCHEDULED == tasks[index]->m_state) {
-      pthread_cond_wait(&tasks[index]->m_wait, &tasks[index]->m_waitLock);
+  for (i = 0; i < length; ++i) {
+    pthread_mutex_lock(&tasks[i]->m_waitLock);      
+    while (DISPATCH_SCHEDULED == tasks[i]->m_state) {
+      pthread_cond_wait(&tasks[i]->m_wait, &tasks[i]->m_waitLock);
     }
-    pthread_mutex_unlock(&tasks[index]->m_waitLock);
-    dispatch_wait(tasks, index);
+    pthread_mutex_unlock(&tasks[i]->m_waitLock);
   }
   return DISPATCH_OK;
 }
